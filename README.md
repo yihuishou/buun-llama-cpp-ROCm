@@ -45,8 +45,39 @@ cmake -B build \
 cmake --build build -j$(nproc)
 ```
 
-#### [For Windows ROCM](https://github.com/lemonade-sdk/llamacpp-rocm/blob/main/docs/manual_instructions.md)
-Test on ROCm 7.13 + AMD Radeon AI PRO R9700
+#### Windows Build ROCm Version
+environment ROCm 7.13 + AMD Radeon RX 7900XTX + Windows 10
+
+需要 VisualStudio Cmake Ninja Python
+
+去 https://therock-hud-dev.amd.com/ 中找到最新的 Windows 系统 ROCm 包
+
+解压，然后修改系统环境变量，将 Bin 目录加入系统环境变量中
+
+然后找一下 Visual Studio 的编译工具路径 rc.exe
+
+我这里是 C:/Program Files (x86)/Microsoft Visual Studio/Shared/NuGetPackages/microsoft.windows.sdk.buildtools/10.0.26100.1742/bin/10.0.26100.0/x64/rc.exe
+
+在项目根目录下打开 PowerShell 控制台，分别执行这两条命令，创建构建目录
+
+mkdir build
+
+cd build
+
+```angular2html
+cmake .. -G Ninja -DCMAKE_C_COMPILER="C:/AMD/ROCm/lib/llvm/bin/clang.exe" -B build -DCMAKE_RC_COMPILER="C:/Program Files (x86)/Microsoft Visual Studio/Shared/NuGetPackages/microsoft.windows.sdk.buildtools/10.0.26100.1742/bin/10.0.26100.0/x64/rc.exe" -DCMAKE_CXX_COMPILER="C:/AMD/ROCm/lib/llvm/bin/clang++.exe" -DCMAKE_CROSSCOMPILING=ON -DCMAKE_BUILD_TYPE=Release -DAMDGPU_TARGETS="gfx1100" -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DGGML_HIP=ON -DGGML_OPENMP=OFF -DGGML_CUDA_FORCE_CUBLAS=OFF -DGGML_HIP_ROCWMMA_FATTN=OFF -DGGML_HIP_FORCE_ROCWMMA_FATTN_GFX12=OFF -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_STATIC=OFF -DCMAKE_SYSTEM_NAME=Windows
+```
+其中 DCMAKE_CXX_COMPILER 和 DCMAKE_C_COMPILER 要制定为从网站下载的 ROCm 包。
+
+DCMAKE_RC_COMPILER 制定为 Visual Studio 的编译工具路径 rc.exe。
+
+DAMDGPU_TARGETS 制定为显卡核心代号，7900XTX 核心代号 gfx1100，根据自己的显卡核心修改。
+
+等待执行命令完毕后
+
+再执行 cmake --build build -j 24 --config Release 2>&1 | findstr /i "error"
+
+编程产物在 bin 目录中
 
 ## Recommended configurations
 
