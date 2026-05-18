@@ -164,6 +164,7 @@ struct server_slot {
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        llama_mtp_kv_clear(ctx);
         prompt.tokens.clear();
     }
 
@@ -194,7 +195,9 @@ struct server_slot {
 
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
+    llama_seq_id seq_id_backup = -1;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
+    int  mtp_kv_n_before_draft = 0; // MTP KV buffer position before draft verify
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -222,7 +225,9 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         has_draft_backup = false;
+        seq_id_backup = -1;
         n_tokens_before_draft = 0;
+        mtp_kv_n_before_draft = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -312,6 +317,10 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        if (common_sampler_grammar_is_active(smpl.get())) {
             return 0;
         }
 
@@ -421,6 +430,11 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+
+            // clean up speculative backup sequence to avoid orphaned KV cells
+            if (has_draft_backup && seq_id_backup >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id_backup, -1, -1);
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -752,6 +766,35 @@ private:
         prompt_cache->update();
     }
 
+    void recurrent_shrink_for_prefill(const char * reason) {
+        if (!recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
+            return;
+        }
+
+        for (const server_slot & slot : slots) {
+            if (slot.is_processing() || slot.has_draft_backup) {
+                SRV_DBG("not shrinking recurrent state for prefill (%s): slot %d processing=%d has_backup=%d\n",
+                        reason, slot.id, slot.is_processing(), slot.has_draft_backup);
+                return;
+            }
+        }
+
+        auto * mem = llama_get_memory(ctx);
+        for (const server_slot & slot : slots) {
+            const llama_seq_id seq_backup = slot.id + n_parallel_user;
+            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+        }
+
+        if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
+            recurrent_expanded = false;
+            SRV_INF("shrunk recurrent state to %d cells for prefill (%s, removed %d backup cells)\n",
+                    n_parallel_user, reason, n_seq_max_full - n_parallel_user);
+        } else {
+            SRV_ERR("failed to shrink recurrent state to %d cells for prefill (%s)\n",
+                    n_parallel_user, reason);
+        }
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -782,7 +825,9 @@ private:
         // Expanded back to 2*n_parallel before first speculative draft.
         n_parallel_user = params_base.n_parallel;
         recurrent_expanded = true;
-        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
+        if (params_base.speculative.has_dft() ||
+            (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+             params_base.speculative.type != COMMON_SPECULATIVE_TYPE_MTP)) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
@@ -1289,6 +1334,8 @@ private:
         }
 
         if (ret) {
+            recurrent_shrink_for_prefill("before prompt cache save/load");
+
             const auto & tokens = ret->prompt.tokens;
 
             update_cache = update_cache && prompt_cache;
@@ -2031,9 +2078,29 @@ private:
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        // Unified KV: check if launching this task would overflow the shared cell pool.
+                        // Use max(current, planned) since a just-launched slot hasn't filled yet.
+                        if (params_base.kv_unified && task.n_tokens() > 0) {
+                            int64_t cells_committed = 0;
+                            for (const auto & s : slots) {
+                                if (s.is_processing() && s.task) {
+                                    cells_committed += std::max((int64_t) s.prompt.n_tokens(), (int64_t) s.task->n_tokens());
+                                }
+                            }
+                            const int64_t cells_available = (int64_t) slot->n_ctx - cells_committed;
+                            if (cells_available < (int64_t) task.n_tokens()) {
+                                SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
+                                        id_task, task.n_tokens(), cells_available, cells_committed);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                        }
+
+                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -2455,13 +2522,14 @@ private:
                 }
 
                 slot.n_tokens_before_draft = slot.prompt.n_tokens();
+                slot.mtp_kv_n_before_draft = llama_mtp_kv_n_used(ctx);
 
                 // add the sampled token to the batch
                 slot.spec_i_batch.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
 
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
+                if (draft.empty() || slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
                     // fallback to normal decoding
                     slot.i_batch = slot.spec_i_batch[0];
@@ -2471,7 +2539,7 @@ private:
                     // keep track of total number of drafted tokens tested
                     slot.n_draft_total += draft.size();
 
-                    if (needs_reeval) {
+                    if (needs_reeval && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
                         // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_tape_replay_sync(ctx);
@@ -2498,6 +2566,7 @@ private:
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
                         llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
                         slot.has_draft_backup = true;
+                        slot.seq_id_backup = seq_backup;
                     }
 
                     // add all drafted tokens to the batch
@@ -2791,6 +2860,11 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         const size_t checkpoint_size = it->data.size();
+                                        SLT_DBG(slot,
+                                                "restoring context checkpoint data=%.3f MiB ring=%.3f MiB recurrent_expanded=%d n_parallel_user=%d n_seq_max_full=%d\n",
+                                                (float) it->data.size() / 1024 / 1024,
+                                                (float) it->ring_data.size() / 1024 / 1024,
+                                                recurrent_expanded, n_parallel_user, n_seq_max_full);
                                         const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
@@ -3298,14 +3372,10 @@ private:
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
-                // update DFlash hidden state ring buffer with the decoded token's hidden states.
-                // Skip on the first sample after prompt: common_speculative_begin() above already
-                // populated the ring with all prefill hiddens. The capture buffer at this point
-                // still holds prefill hiddens (no new decode happened), so ring_write(1) here would
-                // append a stale duplicate at the position that should later hold `id`'s hidden —
-                // silently corrupting the drafter's cross-attention context on every subsequent
-                // verify. Fires correctly on the fallback non-spec path during generation
-                // (draft too small → single-token decode), where slot.sampled was just decoded.
+                // Update speculative state with newly decoded token's logits.
+                // Skip on the first sample after prompt: begin() already pre-populated from
+                // the prompt eval's MTP output, and for DFlash the capture buffer still holds
+                // stale prefill hiddens (ring_write would corrupt cross-attention context).
                 if (slot.can_speculate() && slot.n_decoded > 0) {
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx, slot.id);
@@ -3389,7 +3459,7 @@ private:
                 slot.prompt.tokens.insert(llama_tokens(ids.begin(), ids.end() - 1));
 
                 if (slot.has_draft_backup) {
-                    const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                    const llama_seq_id seq_backup = slot.seq_id_backup;
                     const bool all_accepted = (ids.size() == n_draft + 1);
 
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
@@ -3419,6 +3489,9 @@ private:
                             llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
 
+                            // MTP KV: rollback to pre-draft + accepted
+                            llama_mtp_kv_seq_rm(ctx, slot.mtp_kv_n_before_draft + (int) ids.size());
+
                             const int n_reeval = slot.prompt.n_tokens() - n_past_before;
                             if (n_reeval > 0) {
                                 llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
@@ -3432,7 +3505,13 @@ private:
                         }
                     }
 
+                    // MTP KV rollback (no backup path — MTP skips backup to preserve CUDA graphs)
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                        llama_mtp_kv_seq_rm(ctx, slot.mtp_kv_n_before_draft + (int) ids.size());
+                    }
+
                     slot.has_draft_backup = false;
+                    slot.seq_id_backup = -1;
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
                 }
